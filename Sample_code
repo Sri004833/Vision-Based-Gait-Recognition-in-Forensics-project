@@ -1,0 +1,174 @@
+import streamlit as st
+import cv2
+import mediapipe as mp
+import numpy as np
+import json
+import os
+import tensorflow as tf
+from tensorflow.keras.applications.resnet50 import ResNet50, preprocess_input
+
+# --------------------------- Utility Functions ---------------------------
+
+def calculate_angle(a, b, c):
+    """Calculate the angle (in degrees) between three points."""
+    a = np.array(a)
+    b = np.array(b)
+    c = np.array(c)
+    radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(a[1] - b[1], a[0] - b[0])
+    angle = np.abs(radians * 180.0 / np.pi)
+    if angle > 180.0:
+        angle = 360 - angle
+    return angle
+
+# Initialize models
+mp_pose = mp.solutions.pose
+mp_pose_instance = mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
+mp_drawing = mp.solutions.drawing_utils
+resnet_model = ResNet50(weights='imagenet', include_top=False, pooling='avg')
+
+# --------------------------- Video Processing ---------------------------
+
+def process_video(video_path, angle_threshold=5.0, display_container=None):
+    important_features_db = {}
+    previous_angles = None
+    cap = cv2.VideoCapture(video_path)
+    frame_idx = 0
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_resized = cv2.resize(frame, (224, 224))
+        frame_rgb_small = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+        frame_preprocessed = preprocess_input(frame_rgb_small.astype(np.float32))
+        frame_input = np.expand_dims(frame_preprocessed, axis=0)
+        features = resnet_model.predict(frame_input)
+        current_resnet_features = features[0].tolist()
+
+        image_for_pose = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image_for_pose.flags.writeable = False
+        results = mp_pose_instance.process(image_for_pose)
+        image_for_pose.flags.writeable = True
+
+        if results.pose_landmarks:
+            mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+            lm = results.pose_landmarks.landmark
+
+            keypoints = lambda name: [lm[getattr(mp_pose.PoseLandmark, name).value].x,
+                                      lm[getattr(mp_pose.PoseLandmark, name).value].y]
+
+            angles = {
+                "left_knee": calculate_angle(keypoints("LEFT_HIP"), keypoints("LEFT_KNEE"), keypoints("LEFT_ANKLE")),
+                "right_knee": calculate_angle(keypoints("RIGHT_HIP"), keypoints("RIGHT_KNEE"), keypoints("RIGHT_ANKLE")),
+                "left_hip": calculate_angle(keypoints("LEFT_SHOULDER"), keypoints("LEFT_HIP"), keypoints("LEFT_KNEE")),
+                "right_hip": calculate_angle(keypoints("RIGHT_SHOULDER"), keypoints("RIGHT_HIP"), keypoints("RIGHT_KNEE")),
+                "left_ankle": calculate_angle(keypoints("LEFT_KNEE"), keypoints("LEFT_ANKLE"), keypoints("LEFT_FOOT_INDEX")),
+                "right_ankle": calculate_angle(keypoints("RIGHT_KNEE"), keypoints("RIGHT_ANKLE"), keypoints("RIGHT_FOOT_INDEX"))
+            }
+
+            if previous_angles is None or any(abs(angles[k] - previous_angles[k]) > angle_threshold for k in angles):
+                important_features_db[str(frame_idx)] = {"angles": angles, "resnet_features": current_resnet_features}
+                previous_angles = angles
+
+            if display_container is not None:
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                display_container.image(frame_rgb, channels="RGB")
+
+        frame_idx += 1
+
+    cap.release()
+    features_list = [data["resnet_features"] for data in important_features_db.values()]
+    avg_vector = np.mean(np.array(features_list), axis=0) if features_list else None
+    return important_features_db, avg_vector
+
+# --------------------------- Enrollment ---------------------------
+
+def enroll(video_path, db_file="video_features.json"):
+    st.write("Processing enrollment video...")
+    display_container = st.empty()
+    important_features_db, avg_vector = process_video(video_path, display_container=display_container)
+
+    if os.path.exists(db_file):
+        with open(db_file, 'r') as f:
+            all_features = json.load(f)
+    else:
+        all_features = {}
+
+    user_ids = [int(key.split('_')[1]) for key in all_features.keys() if key.startswith('user_')]
+    next_user_id = f"user_{max(user_ids)+1}" if user_ids else "user_1"
+    all_features[next_user_id] = important_features_db
+
+    with open(db_file, 'w') as f:
+        json.dump(all_features, f, indent=4)
+
+    st.success(f"Enrollment successful. Your user id is: {next_user_id}")
+    return next_user_id, avg_vector
+
+# --------------------------- Authentication ---------------------------
+
+def authenticate(video_path, user_id, db_file="video_features.json", similarity_threshold=0.8):
+    st.write("Processing check video for authentication...")
+    display_container = st.empty()
+    _, avg_vector_check = process_video(video_path, display_container=display_container)
+
+    if avg_vector_check is None:
+        st.error("No features extracted from check video.")
+        return False
+
+    if not os.path.exists(db_file):
+        st.error("No enrolled users found in the database.")
+        return False
+
+    with open(db_file, 'r') as f:
+        all_features = json.load(f)
+
+    if user_id not in all_features:
+        st.error("User id not found in the database.")
+        return False
+
+    user_features_list = [data["resnet_features"] for data in all_features[user_id].values()]
+    if not user_features_list:
+        st.error("No features found for the enrolled user.")
+        return False
+
+    avg_vector_enrolled = np.mean(np.array(user_features_list), axis=0)
+
+    cosine_similarity = np.dot(avg_vector_check, avg_vector_enrolled) / (
+        np.linalg.norm(avg_vector_check) * np.linalg.norm(avg_vector_enrolled)
+    )
+    st.write("Cosine similarity:", cosine_similarity)
+
+    if cosine_similarity >= similarity_threshold:
+        st.success(f"Authentication successful: Same person ({user_id})")
+        return True
+    else:
+        st.error("Authentication failed: Not the same person.")
+        return False
+
+# --------------------------- Streamlit Interface ---------------------------
+
+st.title("Gait-Based Person Authentication App")
+
+mode = st.radio("Select Mode", ("Enrollment", "Authentication"))
+
+if mode == "Enrollment":
+    st.header("Enrollment")
+    enroll_video = st.file_uploader("Upload enrollment video", type=["mp4", "mov", "avi"])
+    if enroll_video is not None:
+        enroll_video_path = "temp_enroll.mp4"
+        with open(enroll_video_path, "wb") as f:
+            f.write(enroll_video.getbuffer())
+        if st.button("Enroll"):
+            enroll(enroll_video_path)
+
+elif mode == "Authentication":
+    st.header("Authentication")
+    auth_video = st.file_uploader("Upload check video", type=["mp4", "mov", "avi"])
+    user_id_input = st.text_input("Enter the enrolled user id (e.g., user_1):")
+    if auth_video is not None and user_id_input:
+        auth_video_path = "temp_auth.mp4"
+        with open(auth_video_path, "wb") as f:
+            f.write(auth_video.getbuffer())
+        if st.button("Authenticate"):
+            authenticate(auth_video_path, user_id_input)
